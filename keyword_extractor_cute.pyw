@@ -59,24 +59,30 @@ class KeywordExtractor:
                     api_key = config.get('gemini_api_key')
                     if api_key and api_key != "YOUR_API_KEY_HERE":
                         genai.configure(api_key=api_key)
-                        # 新しいGeminiモデルを試す
-                        try:
-                            self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-                            self.use_ai = True
-                            print("Gemini API (gemini-1.5-flash) が正常に設定されました")
-                        except:
+                        # 利用可能なGeminiモデルを試す（2025年版）
+                        models_to_try = [
+                            'gemini-2.5-flash',
+                            'gemini-2.0-flash',
+                            'gemini-flash-latest',
+                            'gemini-2.5-pro',
+                            'gemini-pro-latest'
+                        ]
+
+                        model_found = False
+                        for model_name in models_to_try:
                             try:
-                                self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
+                                self.gemini_model = genai.GenerativeModel(model_name)
                                 self.use_ai = True
-                                print("Gemini API (gemini-1.5-pro) が正常に設定されました")
-                            except:
-                                try:
-                                    self.gemini_model = genai.GenerativeModel('gemini-pro')
-                                    self.use_ai = True
-                                    print("Gemini API (gemini-pro) が正常に設定されました")
-                                except:
-                                    print("Gemini APIモデルが見つかりません。AIを無効にして続行します。")
-                                    self.use_ai = False
+                                print(f"Gemini API ({model_name}) が正常に設定されました")
+                                model_found = True
+                                break
+                            except Exception as e:
+                                print(f"モデル {model_name} の設定に失敗: {e}")
+                                continue
+
+                        if not model_found:
+                            print("利用可能なGemini APIモデルが見つかりません。AIを無効にして続行します。")
+                            self.use_ai = False
                     else:
                         print("Gemini APIキーが未設定です")
                         self.use_ai = False
@@ -1496,12 +1502,16 @@ class CuteKeywordExtractorGUI:
                         continue
 
                     # 通常のタイトル処理
-                    result = self.extractor.process_single_title(
-                        title,
-                        self.extract_mode.get(),
-                        translate_mode,
-                        self.include_brand.get()
-                    )
+                    try:
+                        result = self.extractor.process_single_title(
+                            title,
+                            self.extract_mode.get(),
+                            translate_mode,
+                            self.include_brand.get()
+                        )
+                    except Exception as e:
+                        print(f"process_single_title エラー: {asin} -> {e}")
+                        continue
 
                     # ASINから取得したブランド名がある場合はそれを優先
                     if brand_from_asin:
@@ -1564,37 +1574,8 @@ class CuteKeywordExtractorGUI:
 
                         # リアルタイム表示
                         self.display_result(result)
-
-                    # データの各値にパディングを追加（視覚的な区切り）
-                    # タイトルは切らずに全文表示
-                    title_val = result['original_title']
-                    brand_val = result['brand'] or ''
-
-                    # フルデータを保存（コピー用）
-                    item_id = self.result_tree.insert('', 'end', values=(
-                        title_val,
-                        brand_val,
-                        keywords_str,
-                        translated_keywords_str
-                    ), tags=tags)
-
-                    # 完全なデータを別途保存（表示用とは別に）
-                    if not hasattr(self, 'full_data'):
-                        self.full_data = []
-                    self.full_data.append({
-                        'title': result['original_title'],
-                        'brand': result['brand'] or '',
-                        'keywords': keywords_str,
-                        'translated_keywords': translated_keywords_str
-                    })
-
-                    # 処理完了後に画面を即座に更新
-                    self.stats_label.config(
-                        text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: {i}/{total_count}"
-                    )
-                    self.root.update()
-                else:
-                    print(f"失敗: result_listが空またはNone")
+                    else:
+                        print(f"失敗: result_listが空またはNone")
 
             # 統計更新（最終）
             self.stats_label.config(
