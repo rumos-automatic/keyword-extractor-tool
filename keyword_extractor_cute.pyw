@@ -304,6 +304,47 @@ class KeywordExtractor:
         current = self.prompt_data.get('current_template', 'default')
         return self.prompt_data['templates'].get(current, self.prompt_data['templates']['default'])
 
+    def validate_ai_keywords(self, keywords: List[str], title: str) -> List[str]:
+        """AIが生成したキーワードがタイトルに実際に存在するかを検証"""
+        # タイトルから実際の単語を抽出
+        title_words = self._extract_words_from_title(title)
+        title_words_lower = [word.lower() for word in title_words]
+
+        validated_keywords = []
+
+        for keyword in keywords:
+            keyword_lower = keyword.lower()
+
+            # 明らかに説明文や文章を除外
+            if any(phrase in keyword for phrase in ['です', 'ます', 'について', 'キーワード', '制造', '製造', 'WF4', 'された']):
+                print(f"説明文として除外: {keyword}")
+                continue
+
+            # 長すぎるキーワード（20文字以上）を除外
+            if len(keyword) > 20:
+                print(f"長すぎるキーワードを除外: {keyword}")
+                continue
+
+            # タイトルの単語と完全一致または部分一致をチェック
+            is_valid = False
+
+            # 完全一致チェック
+            if keyword_lower in title_words_lower:
+                is_valid = True
+            else:
+                # 部分一致チェック（タイトルの単語の一部として含まれているか）
+                for title_word in title_words_lower:
+                    if keyword_lower in title_word or title_word in keyword_lower:
+                        is_valid = True
+                        break
+
+            if is_valid:
+                validated_keywords.append(keyword)
+            else:
+                print(f"タイトルに存在しないキーワードを除外: {keyword}")
+
+        return validated_keywords
+
     def extract_keywords_strict(self, title: str, include_brand: bool, brand: str) -> List[str]:
         """厳しめモード：ほぼ同じ商品を探すためのキーワード抽出（タイトルの単語をそのまま使う）"""
         keywords = []
@@ -487,7 +528,13 @@ class KeywordExtractor:
             # 空のキーワードを除去
             keywords = [kw for kw in keywords if kw]
 
-            return keywords
+            # AI結果の検証：タイトルに存在しない単語や説明文をフィルタリング
+            validated_keywords = self.validate_ai_keywords(keywords, title)
+            if len(validated_keywords) < len(keywords):
+                print(f"AIキーワード検証: {len(keywords)}個中{len(validated_keywords)}個が有効でした")
+                print(f"無効なキーワード: {[kw for kw in keywords if kw not in validated_keywords]}")
+
+            return validated_keywords
 
         except Exception as e:
             print(f"AIキーワード抽出エラー: {e}")
@@ -553,14 +600,23 @@ class KeywordExtractor:
         if translate_mode == 'none':  # 翻訳なし
             result['keywords'] = keywords
             result['translated_keywords'] = []
-        elif translate_mode == 'ja_to_en':  # 日本語→英語
+        elif translate_mode == 'auto':  # 自動判定翻訳
             result['keywords'] = keywords
-            translated_kw = [self.translate_text(kw, 'en') for kw in keywords]
-            result['translated_keywords'] = translated_kw
-        elif translate_mode == 'en_to_ja':  # 英語→日本語
-            result['keywords'] = keywords
-            translated_kw = [self.translate_text(kw, 'ja') for kw in keywords]
-            result['translated_keywords'] = translated_kw
+
+            # 抽出されたキーワードの言語を判定
+            keywords_text = ' '.join(keywords)
+            detected_lang = self.detect_language(keywords_text)
+
+            if detected_lang == 'ja':
+                # 日本語→英語に翻訳
+                translated_kw = [self.translate_text(kw, 'en') for kw in keywords]
+                result['translated_keywords'] = translated_kw
+                print(f"日本語キーワードを英語に翻訳: {keywords} → {translated_kw}")
+            else:
+                # 英語→日本語に翻訳
+                translated_kw = [self.translate_text(kw, 'ja') for kw in keywords]
+                result['translated_keywords'] = translated_kw
+                print(f"英語キーワードを日本語に翻訳: {keywords} → {translated_kw}")
 
         return result
 
@@ -607,21 +663,23 @@ class KeywordExtractor:
 
             # 翻訳モードに応じた処理
             if translate_mode == 'none':  # 翻訳なし
-                # 抽出キーワードのみ、翻訳キーワードは空
                 result['keywords'] = keywords
                 result['translated_keywords'] = []
-            elif translate_mode == 'ja_to_en':  # 日本語→英語
-                # 抽出キーワード：元の日本語キーワード
+            elif translate_mode == 'auto':  # 自動判定翻訳
                 result['keywords'] = keywords
-                # 翻訳キーワード：英語に翻訳（Amazon英語サイトで検索用）
-                translated_kw = [self.translate_text(kw, 'en') for kw in keywords]
-                result['translated_keywords'] = translated_kw
-            elif translate_mode == 'en_to_ja':  # 英語→日本語
-                # 抽出キーワード：元の英語キーワード
-                result['keywords'] = keywords
-                # 翻訳キーワード：日本語に翻訳（Amazon日本サイトで検索用）
-                translated_kw = [self.translate_text(kw, 'ja') for kw in keywords]
-                result['translated_keywords'] = translated_kw
+
+                # 抽出されたキーワードの言語を判定
+                keywords_text = ' '.join(keywords)
+                detected_lang = self.detect_language(keywords_text)
+
+                if detected_lang == 'ja':
+                    # 日本語→英語に翻訳
+                    translated_kw = [self.translate_text(kw, 'en') for kw in keywords]
+                    result['translated_keywords'] = translated_kw
+                else:
+                    # 英語→日本語に翻訳
+                    translated_kw = [self.translate_text(kw, 'ja') for kw in keywords]
+                    result['translated_keywords'] = translated_kw
 
             results.append(result)
 
@@ -774,6 +832,14 @@ class CuteKeywordExtractorGUI:
         style.map('Cute.Treeview.Heading',
                  background=[('active', self.colors['accent_hover'])])
 
+        # プログレスバースタイル
+        style.configure('Cute.Horizontal.TProgressbar',
+                       background=self.colors['accent'],
+                       troughcolor=self.colors['bg_main'],
+                       borderwidth=1,
+                       lightcolor=self.colors['accent'],
+                       darkcolor=self.colors['accent'])
+
     def create_rounded_button(self, parent, text, bg_color, hover_color, command, width=150):
         """丸みのあるボタンを作成"""
         button_frame = tk.Frame(parent, bg=self.colors['bg_main'])
@@ -861,7 +927,7 @@ class CuteKeywordExtractorGUI:
         title_frame.pack_propagate(False)
 
         title_label = tk.Label(title_frame,
-                              text="Amazon商品キーワード抽出ツール",
+                              text="Amazon ASIN キーワード抽出ツール",
                               font=self.get_scaled_font('title', bold=True),
                               bg=self.colors['bg_secondary'],
                               fg=self.colors['text_primary'])
@@ -869,7 +935,7 @@ class CuteKeywordExtractorGUI:
         self.ui_widgets.append({'widget': title_label, 'font_type': 'title', 'bold': True})
 
         subtitle = tk.Label(title_frame,
-                          text="商品タイトルからAIを使用した高精度なキーワード抽出",
+                          text="ASINから商品情報を取得してAIによる高精度なキーワード抽出",
                           font=self.get_scaled_font('subtitle'),
                           bg=self.colors['bg_secondary'],
                           fg=self.colors['text_secondary'])
@@ -908,8 +974,7 @@ class CuteKeywordExtractorGUI:
                                           font=self.get_scaled_font('label'))
         self.translate_mode['values'] = [
             'なし',
-            '日本語→英語',
-            '英語→日本語'
+            'あり'
         ]
         self.translate_mode.set('なし')
         self.translate_mode.pack(fill='x', pady=5)
@@ -1070,6 +1135,30 @@ class CuteKeywordExtractorGUI:
                                    justify='left')
         self.stats_label.pack(pady=5)
 
+        # プログレスバー
+        progress_frame = tk.Frame(stats_frame, bg=self.colors['bg_tertiary'])
+        progress_frame.pack(fill='x', pady=(10, 5))
+
+        self.progress_label = tk.Label(progress_frame,
+                                     text="進捗",
+                                     font=self.get_scaled_font('small'),
+                                     bg=self.colors['bg_tertiary'],
+                                     fg=self.colors['text_primary'])
+        self.progress_label.pack(anchor='w')
+
+        self.progress_bar = ttk.Progressbar(progress_frame,
+                                          mode='determinate',
+                                          length=250,
+                                          style='Cute.Horizontal.TProgressbar')
+        self.progress_bar.pack(fill='x', pady=2)
+
+        self.progress_text = tk.Label(progress_frame,
+                                    text="0 / 0 (0%)",
+                                    font=self.get_scaled_font('small'),
+                                    bg=self.colors['bg_tertiary'],
+                                    fg=self.colors['text_primary'])
+        self.progress_text.pack(anchor='w')
+
         # 右側パネル（メインコンテンツ）
         right_panel = tk.Frame(content_frame, bg=self.colors['bg_main'])
         right_panel.pack(side='left', fill='both', expand=True)
@@ -1081,36 +1170,28 @@ class CuteKeywordExtractorGUI:
         input_header = tk.Frame(input_container, bg=self.colors['bg_secondary'])
         input_header.pack(fill='x', padx=15, pady=(15, 5))
 
-        # 入力モード切り替えトグルボタン
-        self.input_mode = tk.StringVar(value="title")  # "title" or "asin"
-        mode_frame = tk.Frame(input_header, bg=self.colors['bg_secondary'])
-        mode_frame.pack(side='left')
+        # ASIN専用モード（商品タイトル機能を削除）
+        self.input_mode = tk.StringVar(value="asin")  # ASINのみ
 
-        title_mode_btn = tk.Radiobutton(mode_frame,
-                                      text="商品タイトル",
-                                      variable=self.input_mode,
-                                      value="title",
-                                      font=self.get_scaled_font('body'),
-                                      bg=self.colors['bg_secondary'],
-                                      fg=self.colors['text_primary'],
-                                      selectcolor=self.colors['accent'],
-                                      command=self.on_input_mode_change)
-        title_mode_btn.pack(side='left', padx=(0, 10))
+        # ASIN入力ラベル（一番左に配置）
+        self.input_label = tk.Label(input_header,
+                text="ASIN入力",
+                font=self.get_scaled_font('heading', bold=True),
+                bg=self.colors['bg_secondary'],
+                fg=self.colors['text_primary'])
+        self.input_label.pack(side='left', padx=(0, 5))
 
-        asin_mode_btn = tk.Radiobutton(mode_frame,
-                                     text="ASIN",
-                                     variable=self.input_mode,
-                                     value="asin",
-                                     font=self.get_scaled_font('body'),
-                                     bg=self.colors['bg_secondary'],
-                                     fg=self.colors['text_primary'],
-                                     selectcolor=self.colors['accent'],
-                                     command=self.on_input_mode_change)
-        asin_mode_btn.pack(side='left', padx=(0, 20))
+        self.input_hint = tk.Label(input_header,
+                text="(1行に1ASIN)",
+                font=self.get_scaled_font('small'),
+                bg=self.colors['bg_secondary'],
+                fg=self.colors['text_secondary'])
+        self.input_hint.pack(side='left', padx=(0, 20))
 
-        # Amazon地域選択（ASINモード時のみ表示）
+        # Amazon地域選択（右側に配置）
         self.amazon_region = tk.StringVar(value="jp")  # "jp" or "us"
         self.region_frame = tk.Frame(input_header, bg=self.colors['bg_secondary'])
+        self.region_frame.pack(side='left')
 
         jp_region_btn = tk.Radiobutton(self.region_frame,
                                      text="日本Amazon",
@@ -1132,40 +1213,12 @@ class CuteKeywordExtractorGUI:
                                      selectcolor=self.colors['accent'])
         us_region_btn.pack(side='left', padx=(0, 10))
 
-        # 入力ラベル（動的に変更される）
-        self.input_label = tk.Label(input_header,
-                text="商品タイトル入力",
-                font=self.get_scaled_font('heading', bold=True),
-                bg=self.colors['bg_secondary'],
-                fg=self.colors['text_primary'])
-        self.input_label.pack(side='left')
-
-        self.input_hint = tk.Label(input_header,
-                text="(1行に1商品)",
-                font=self.get_scaled_font('small'),
-                bg=self.colors['bg_secondary'],
-                fg=self.colors['text_secondary'])
-        self.input_hint.pack(side='left', padx=(10, 0))
-
         # テキスト入力エリアを作成
         self.create_input_area(input_container)
 
         # 右パネルのメイン部分を作成
         self.create_main_right_panel(right_panel)
 
-    def on_input_mode_change(self):
-        """入力モード切り替え時の処理"""
-        mode = self.input_mode.get()
-        if mode == "asin":
-            self.input_label.config(text="ASIN入力")
-            self.input_hint.config(text="(1行に1ASIN)")
-            # Amazon地域選択を表示
-            self.region_frame.pack(side='left', padx=(20, 0))
-        else:
-            self.input_label.config(text="商品タイトル入力")
-            self.input_hint.config(text="(1行に1商品)")
-            # Amazon地域選択を非表示
-            self.region_frame.pack_forget()
 
     def display_result(self, result):
         """結果を表示に追加"""
@@ -1177,11 +1230,13 @@ class CuteKeywordExtractorGUI:
         tags = ('oddrow',) if row_index % 2 == 0 else ('evenrow',)
 
         # データの各値にパディングを追加（視覚的な区切り）
+        asin_val = result.get('asin', '')  # ASINを取得
         title_val = result['original_title']
         brand_val = result['brand'] or ''
 
         # フルデータを保存（コピー用）
         item_id = self.result_tree.insert('', 'end', values=(
+            asin_val,
             title_val,
             brand_val,
             keywords_str,
@@ -1190,11 +1245,11 @@ class CuteKeywordExtractorGUI:
 
         # フルデータ配列に追加
         self.full_data.append({
+            'asin': asin_val,
             'title': title_val,
             'brand': brand_val,
             'keywords': keywords_str,
-            'translated_keywords': translated_keywords_str,
-            'asin': result.get('asin', '')  # ASINがある場合は保存
+            'translated_keywords': translated_keywords_str
         })
 
         # テーブルを自動スクロール
@@ -1251,6 +1306,8 @@ class CuteKeywordExtractorGUI:
 
         self.create_rounded_button(button_container2, "一括コピー",
                                   '#2196F3', '#1976D2', self.copy_results, width=120)
+        self.create_rounded_button(button_container2, "ASINコピー",
+                                  '#2196F3', '#1976D2', lambda: self.copy_column('asin'), width=120)
         self.create_rounded_button(button_container2, "ブランドコピー",
                                   '#2196F3', '#1976D2', lambda: self.copy_column('brand'), width=140)
         self.create_rounded_button(button_container2, "キーワードコピー",
@@ -1286,15 +1343,15 @@ class CuteKeywordExtractorGUI:
         table_frame.pack(fill='both', expand=True, padx=15, pady=(0, 15))
 
         # Treeviewウィジェット
-        columns = ('商品タイトル', 'ブランド', '抽出キーワード', '翻訳キーワード')
+        columns = ('ASIN', '商品タイトル', 'ブランド', '抽出キーワード', '翻訳キーワード')
         self.result_tree = ttk.Treeview(table_frame, columns=columns, show='headings',
                                        style='Cute.Treeview', height=10, selectmode='none')
 
         # カラムの設定
-        widths = [350, 100, 350, 350]
+        widths = [100, 300, 100, 300, 300]
         for col, width in zip(columns, widths):
             self.result_tree.heading(col, text=col)
-            self.result_tree.column(col, width=width, minwidth=100)
+            self.result_tree.column(col, width=width, minwidth=80)
 
         # セルハイライト用の変数
         self.highlighted_item = None
@@ -1357,7 +1414,7 @@ class CuteKeywordExtractorGUI:
                         self.root.clipboard_append(values[col_index])
 
                         # フィードバック表示
-                        column_names = ['商品タイトル', 'ブランド', '抽出キーワード', '翻訳キーワード']
+                        column_names = ['ASIN', '商品タイトル', 'ブランド', '抽出キーワード', '翻訳キーワード']
                         self.result_status.config(
                             text=f"{column_names[col_index]}をコピーしました",
                             fg='#2196F3'  # 水色（一括コピーと同じ色）
@@ -1382,7 +1439,7 @@ class CuteKeywordExtractorGUI:
 
         # 列ごとのスクロール
         def scroll_to_column(col_index):
-            columns = ['title', 'brand', 'keywords', 'translated_kw']
+            columns = ['asin', 'title', 'brand', 'keywords', 'translated_kw']
             if 0 <= col_index < len(columns):
                 bbox = self.result_tree.bbox(self.result_tree.get_children()[0] if self.result_tree.get_children() else '', columns[col_index])
                 if bbox:
@@ -1393,7 +1450,7 @@ class CuteKeywordExtractorGUI:
                         self.result_tree.xview_scroll(col_index * 2, 'units')
 
         # Ctrl+数字で列ジャンプ
-        for i in range(4):
+        for i in range(5):
             self.root.bind(f'<Control-Key-{i+1}>', lambda e, idx=i: scroll_to_column(idx))
 
         # 左右キーで列移動
@@ -1405,7 +1462,7 @@ class CuteKeywordExtractorGUI:
             # 現在の位置から右にスクロール
             self.result_tree.xview_scroll(1, 'units')
             col_index = 0
-            columns = ['title', 'brand', 'keywords', 'translated_kw']
+            columns = ['asin', 'title', 'brand', 'keywords', 'translated_kw']
             if 0 <= col_index < len(columns):
                 bbox = self.result_tree.bbox(self.result_tree.get_children()[0] if self.result_tree.get_children() else '', columns[col_index])
                 if bbox:
@@ -1431,6 +1488,10 @@ class CuteKeywordExtractorGUI:
 
         # ステータス更新
         self.result_status.config(text="処理中...", fg=self.colors['text_primary'])
+
+        # プログレスバーを初期化
+        self.progress_bar['value'] = 0
+        self.progress_text.config(text="0 / 0 (0%)")
         self.root.update()
 
         # 入力取得
@@ -1439,15 +1500,13 @@ class CuteKeywordExtractorGUI:
 
         if not inputs:
             self.result_status.config(text="入力なし", fg=self.colors['text_primary'])
-            input_type = "ASIN" if self.input_mode.get() == "asin" else "商品タイトル"
-            messagebox.showwarning("警告", f"{input_type}を入力してください")
+            messagebox.showwarning("警告", "ASINを入力してください")
             return
 
         # 翻訳モードの解析
         translate_map = {
             'なし': 'none',
-            '日本語→英語': 'ja_to_en',
-            '英語→日本語': 'en_to_ja'
+            'あり': 'auto'
         }
         translate_mode = translate_map[self.translate_mode.get()]
 
@@ -1469,118 +1528,80 @@ class CuteKeywordExtractorGUI:
             results = []
             processed_count = 0  # 実際に処理された件数
 
-            # 入力モードに応じて処理を分岐
-            if self.input_mode.get() == "asin":
-                # ASINモード：ASINから商品タイトルを取得してから処理
-                for i, asin in enumerate(inputs, 1):
-                    if not self.processing:
-                        break
+            # プログレスバーの最大値を設定
+            self.progress_bar['maximum'] = total_count
+            self.progress_text.config(text=f"0 / {total_count} (0%)")
+            self.root.update()
 
-                    # 一時停止チェック
-                    while self.is_paused and self.processing:
-                        self.root.update()
-                        time.sleep(0.1)
+            # ASIN専用処理（商品タイトルモードを削除）
+            for i, asin in enumerate(inputs, 1):
+                if not self.processing:
+                    break
 
-                    if not self.processing:
-                        break
-
-                    self.result_status.config(
-                        text=f"処理中... {i}/{total_count} (ASIN: {asin})",
-                        fg=self.colors['text_primary']
-                    )
-                    # 統計情報も更新
-                    self.stats_label.config(
-                        text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: {i}/{total_count} 処理中..."
-                    )
+                # 一時停止チェック
+                while self.is_paused and self.processing:
                     self.root.update()
+                    time.sleep(0.1)
 
-                    # ASINから商品タイトルとブランド名を取得
-                    region = self.amazon_region.get()
-                    title, brand_from_asin = self.extractor.fetch_product_info_from_asin(asin, region)
-                    if not title:
-                        print(f"タイトル取得失敗: {asin}")
-                        continue
+                if not self.processing:
+                    break
 
-                    # 通常のタイトル処理
-                    try:
-                        result = self.extractor.process_single_title(
-                            title,
-                            self.extract_mode.get(),
-                            translate_mode,
-                            self.include_brand.get()
-                        )
-                    except Exception as e:
-                        print(f"process_single_title エラー: {asin} -> {e}")
-                        continue
+                self.result_status.config(
+                    text=f"処理中... {i}/{total_count} (ASIN: {asin})",
+                    fg=self.colors['text_primary']
+                )
+                # 統計情報も更新
+                self.stats_label.config(
+                    text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: {i}/{total_count} 処理中..."
+                )
+                # プログレスバーを更新
+                self.progress_bar['value'] = i
+                progress_percent = int((i / total_count) * 100)
+                self.progress_text.config(text=f"{i} / {total_count} ({progress_percent}%)")
+                self.root.update()
 
-                    # ASINから取得したブランド名がある場合はそれを優先
-                    if brand_from_asin:
-                        result['brand'] = brand_from_asin
+                # ASINから商品タイトルとブランド名を取得
+                region = self.amazon_region.get()
+                title, brand_from_asin = self.extractor.fetch_product_info_from_asin(asin, region)
+                if not title:
+                    print(f"タイトル取得失敗: {asin}")
+                    continue
 
-                    result['asin'] = asin  # ASINも結果に保存
-                    results.append(result)
-                    processed_count += 1
-
-                    # ブランド数カウント
-                    if result['brand']:
-                        brand_count += 1
-
-                    # リアルタイム表示
-                    self.display_result(result)
-            else:
-                # タイトルモード：従来の処理
-                for i, title in enumerate(inputs, 1):
-                    # 一時停止チェック
-                    while self.is_paused and self.processing:
-                        self.root.update()
-                        self.root.after(100)  # 100ms待機
-
-                    # 処理中断チェック
-                    if not self.processing:
-                        break
-
-                    # 処理前に進捗更新（1件ごとに毎回更新）
-                    self.stats_label.config(
-                        text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: {i}/{total_count} 処理中..."
+                # キーワード抽出処理
+                try:
+                    result = self.extractor.process_single_title(
+                        title,
+                        self.extract_mode.get(),
+                        translate_mode,
+                        self.include_brand.get()
                     )
-                    self.root.update()
+                except Exception as e:
+                    print(f"process_single_title エラー: {asin} -> {e}")
+                    continue
 
-                    # 1件ずつ処理（詳細ログ）
-                    print(f"処理開始: '{title[:30]}...'")
-                    try:
-                        result_list = self.extractor.process_titles(
-                            [title],  # 1件のみ処理
-                            self.extract_mode.get(),
-                            translate_mode,
-                            self.include_brand.get(),
-                            use_ai=self.use_ai.get()
-                        )
-                        print(f"処理完了: result_list={len(result_list) if result_list else 0}件")
-                    except Exception as e:
-                        print(f"処理エラー: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue  # エラー時は次の項目へ
+                # ASINから取得したブランド名がある場合はそれを優先
+                if brand_from_asin:
+                    result['brand'] = brand_from_asin
 
-                    if result_list:
-                        result = result_list[0]
-                        results.append(result)
-                        processed_count += 1  # 処理成功時にカウント
-                        print(f"成功: キーワード={len(result.get('keywords', []))}個")
+                result['asin'] = asin  # ASINも結果に保存
+                results.append(result)
+                processed_count += 1
 
-                        # ブランド数をカウント
-                        if result['brand']:
-                            brand_count += 1
+                # ブランド数カウント
+                if result['brand']:
+                    brand_count += 1
 
-                        # リアルタイム表示
-                        self.display_result(result)
-                    else:
-                        print(f"失敗: result_listが空またはNone")
+                # リアルタイム表示
+                self.display_result(result)
 
             # 統計更新（最終）
             self.stats_label.config(
                 text=f"件数: {len(results)}\nブランド数: {brand_count}\n処理状況: 完了"
             )
+
+            # プログレスバーを完了状態に
+            self.progress_bar['value'] = total_count
+            self.progress_text.config(text=f"{total_count} / {total_count} (100%)")
 
             # ステータス更新
             self.result_status.config(text=f"✓ {len(results)}件処理完了", fg=self.colors['text_primary'])
@@ -1601,6 +1622,9 @@ class CuteKeywordExtractorGUI:
         self.full_data = []  # フルデータもクリア
         self.result_status.config(text="クリア済み", fg=self.colors['text_secondary'])
         self.stats_label.config(text="件数: 0\nブランド数: 0\n処理状況: 待機中")
+        # プログレスバーもリセット
+        self.progress_bar['value'] = 0
+        self.progress_text.config(text="0 / 0 (0%)")
 
     def pause_processing(self):
         """処理を一時停止/再開"""
@@ -1640,10 +1664,11 @@ class CuteKeywordExtractorGUI:
     def copy_column(self, column_type):
         """特定のカラムをコピー"""
         column_map = {
-            'title': 0,
-            'brand': 1,
-            'keywords': 2,
-            'translated_kw': 3
+            'asin': 0,
+            'title': 1,
+            'brand': 2,
+            'keywords': 3,
+            'translated_kw': 4
         }
 
         column_index = column_map.get(column_type)
@@ -1662,6 +1687,7 @@ class CuteKeywordExtractorGUI:
             self.root.clipboard_append(result_text)
 
             column_names = {
+                'asin': 'ASIN',
                 'title': '商品タイトル',
                 'brand': 'ブランド',
                 'keywords': 'キーワード',
@@ -1690,7 +1716,7 @@ class CuteKeywordExtractorGUI:
             )
             if filename:
                 with open(filename, 'w', encoding='utf-8-sig') as f:
-                    f.write("商品タイトル,ブランド,キーワード,翻訳キーワード\n")
+                    f.write("ASIN,商品タイトル,ブランド,キーワード,翻訳キーワード\n")
                     f.write('\n'.join(results))
                 self.result_status.config(text=f"✓ {filename}に出力しました", fg=self.colors['text_primary'])
         else:
