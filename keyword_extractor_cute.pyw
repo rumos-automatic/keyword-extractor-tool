@@ -4,6 +4,7 @@ import re
 from typing import List, Tuple, Dict
 import json
 import os
+import time
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -203,10 +204,12 @@ class KeywordExtractor:
         import random
 
         if not asin:
+            print(f"ASINが空です")
             return "", ""
 
-        asin = asin.strip()
+        asin = asin.strip().upper()  # ASINを大文字に正規化
         if len(asin) != 10:
+            print(f"ASIN長さエラー: {asin} (長さ: {len(asin)})")
             return "", ""
 
         try:
@@ -218,7 +221,7 @@ class KeywordExtractor:
                 url = f"https://www.amazon.co.jp/dp/{asin}"
                 accept_language = 'ja-JP,ja;q=0.9,en;q=0.8'
 
-            # User-Agentを設定してリクエスト
+            # シンプルなヘッダー設定
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept-Language': accept_language,
@@ -228,7 +231,7 @@ class KeywordExtractor:
                 'Cache-Control': 'max-age=0'
             }
 
-            # リクエスト間隔を設ける
+            # ランダムな待機時間
             time.sleep(random.uniform(1, 3))
 
             response = requests.get(url, headers=headers, timeout=15)
@@ -236,22 +239,77 @@ class KeywordExtractor:
 
             soup = BeautifulSoup(response.content, 'html.parser')
 
-            # 商品タイトルを取得（指定されたセレクター）
-            title = ""
-            title_element = soup.select_one('#productTitle')
-            if title_element:
-                title = title_element.get_text().strip()
+            # CAPTCHAチェック
+            if 'Robot Check' in response.text or 'captcha' in response.text.lower():
+                print(f"⚠️  CAPTCHA検出 ({asin}): Amazonがボット対策でブロックしています")
+                print(f"   対策: 数を減らす、時間を置く、VPN使用、またはブラウザで一度アクセスしてクッキーを取得")
+                return "", ""
 
-            # ブランド名を取得（指定されたセレクター）
+            # 商品タイトルを取得（複数のセレクターを試す）
+            title = ""
+            title_selectors = [
+                '#productTitle',
+                'span#productTitle',
+                'h1#title span',
+                'h1.a-size-large.a-spacing-none',
+                '#title',
+            ]
+
+            for selector in title_selectors:
+                title_element = soup.select_one(selector)
+                if title_element:
+                    title = title_element.get_text().strip()
+                    if title:
+                        print(f"タイトル取得成功 ({selector}): {title[:50]}...")
+                        break
+
+            if not title:
+                print(f"⚠️  タイトル取得失敗: {asin} (すべてのセレクターで失敗)")
+
+            # ブランド名を取得（複数のセレクターを順に試す）
             brand = ""
-            brand_element = soup.select_one('tr.po-brand td.a-span9[role="presentation"] span.a-size-base.po-break-word')
-            if brand_element:
-                brand = brand_element.get_text().strip()
+            brand_selectors = [
+                # productOverview系（アメリカAmazonでよく使われる）
+                '#productOverview_feature_div tr.po-brand td.a-span9 span',
+                'tr.a-spacing-small.po-brand td.a-span9 span',
+                # 製品仕様テーブル系
+                'tr.po-brand td.a-span9 span',  # より汎用的（role属性なし）
+                'tr.po-brand td.a-span9[role="presentation"] span.a-size-base.po-break-word',  # 日本Amazon（厳格版）
+                # bylineInfo系
+                'a#bylineInfo',  # 日本・アメリカAmazon共通
+                '#brand',  # アメリカAmazonの別パターン
+                '.a-row.product-by-line a',  # アメリカAmazonの代替
+                'span.author.notFaded a',  # 書籍など
+            ]
+
+            for selector in brand_selectors:
+                brand_element = soup.select_one(selector)
+                if brand_element:
+                    brand_text = brand_element.get_text().strip()
+                    # 不要なテキストを除去
+                    brand = brand_text.replace('にアクセス', '').replace('Visit the', '').replace('ブランド:', '').replace('Brand:', '').replace('Store', '').replace('のストアを表示', '').replace("'s Store", '').strip()
+                    if brand:  # 空でない場合のみ採用
+                        print(f"ブランド取得成功 ({selector}): {brand}")
+                        break
+
+            if not brand:
+                print(f"ℹ️  ブランド名なし: {asin}")
 
             return title, brand
 
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP エラー ({asin}): {e.response.status_code} - {e}")
+            return "", ""
+        except requests.exceptions.Timeout as e:
+            print(f"タイムアウト エラー ({asin}): {e}")
+            return "", ""
+        except requests.exceptions.RequestException as e:
+            print(f"リクエスト エラー ({asin}): {e}")
+            return "", ""
         except Exception as e:
-            print(f"ASIN取得エラー ({asin}): {e}")
+            print(f"予期しないエラー ({asin}): {type(e).__name__} - {e}")
+            import traceback
+            traceback.print_exc()
             return "", ""
 
     def fetch_product_title_from_asin(self, asin: str) -> str:
@@ -301,11 +359,17 @@ class KeywordExtractor:
 
     def get_current_prompt_template(self):
         """現在選択されているプロンプトテンプレートを取得"""
-        current = self.prompt_data.get('current_template', 'default')
-        return self.prompt_data['templates'].get(current, self.prompt_data['templates']['default'])
+        current = self.prompt_data.get('current_template', 'デフォルト')
+        # デフォルトのフォールバック（古いキーとの互換性も考慮）
+        if current not in self.prompt_data['templates']:
+            current = 'デフォルト' if 'デフォルト' in self.prompt_data['templates'] else list(self.prompt_data['templates'].keys())[0]
+        return self.prompt_data['templates'][current]
 
     def validate_ai_keywords(self, keywords: List[str], title: str) -> List[str]:
-        """AIが生成したキーワードがタイトルに実際に存在するかを検証"""
+        """AIが生成したキーワード（フレーズ）がタイトルに実際に存在するかを検証"""
+        # タイトルを小文字化（検証用）
+        title_lower = title.lower()
+
         # タイトルから実際の単語を抽出
         title_words = self._extract_words_from_title(title)
         title_words_lower = [word.lower() for word in title_words]
@@ -313,30 +377,50 @@ class KeywordExtractor:
         validated_keywords = []
 
         for keyword in keywords:
-            keyword_lower = keyword.lower()
+            keyword_lower = keyword.lower().strip()
+
+            # 空のキーワードをスキップ
+            if not keyword_lower:
+                continue
 
             # 明らかに説明文や文章を除外
-            if any(phrase in keyword for phrase in ['です', 'ます', 'について', 'キーワード', '制造', '製造', 'WF4', 'された']):
+            if any(phrase in keyword for phrase in ['です', 'ます', 'について', 'キーワード', '制造', '製造', 'された', '→', '例:', '例）']):
                 print(f"説明文として除外: {keyword}")
                 continue
 
-            # 長すぎるキーワード（20文字以上）を除外
-            if len(keyword) > 20:
+            # 長すぎるキーワード（100文字以上）を除外
+            if len(keyword) > 100:
                 print(f"長すぎるキーワードを除外: {keyword}")
                 continue
 
-            # タイトルの単語と完全一致または部分一致をチェック
+            # フレーズの検証
             is_valid = False
 
-            # 完全一致チェック
-            if keyword_lower in title_words_lower:
+            # 1. フレーズ全体がタイトルに含まれているかチェック
+            if keyword_lower in title_lower:
                 is_valid = True
             else:
-                # 部分一致チェック（タイトルの単語の一部として含まれているか）
-                for title_word in title_words_lower:
-                    if keyword_lower in title_word or title_word in keyword_lower:
+                # 2. フレーズを単語に分割して、すべての単語がタイトルに存在するかチェック
+                keyword_words = keyword.split()
+                if keyword_words:
+                    # すべての単語がタイトルに存在するか確認
+                    all_words_exist = True
+                    for kw_word in keyword_words:
+                        kw_word_lower = kw_word.lower()
+                        word_exists = False
+
+                        # タイトルの単語と照合
+                        for title_word in title_words_lower:
+                            if kw_word_lower == title_word or kw_word_lower in title_word or title_word in kw_word_lower:
+                                word_exists = True
+                                break
+
+                        if not word_exists:
+                            all_words_exist = False
+                            break
+
+                    if all_words_exist:
                         is_valid = True
-                        break
 
             if is_valid:
                 validated_keywords.append(keyword)
@@ -344,6 +428,61 @@ class KeywordExtractor:
                 print(f"タイトルに存在しないキーワードを除外: {keyword}")
 
         return validated_keywords
+
+    def cleanse_keywords(self, keywords: List[str], mode: str) -> List[str]:
+        """
+        生成後のキーワードクレンジング
+        1) 各フレーズをトークン化 → 連続/非連続の重複単語を削除
+        2) 各フレーズの語数をモードに応じた上限に丸め（超過分は右側から削除）
+        3) 全フレーズ結合後の総語数が上限を超えたら、末尾フレーズから短縮/削除
+        """
+        # モード別の制約
+        mode_limits = {
+            'loose': {'max_words_per_phrase': 3, 'max_total_words': 8},
+            'moderate': {'max_words_per_phrase': 5, 'max_total_words': 12},
+            'strict': {'max_words_per_phrase': 6, 'max_total_words': 14}
+        }
+
+        limits = mode_limits.get(mode, mode_limits['moderate'])
+        max_words_per_phrase = limits['max_words_per_phrase']
+        max_total_words = limits['max_total_words']
+
+        cleansed_phrases = []
+
+        # 1) 各フレーズの処理
+        for phrase in keywords:
+            # フレーズをトークン化（スペース区切り）
+            words = phrase.split()
+
+            # 重複単語を削除（順序を保ちながら）
+            seen = set()
+            unique_words = []
+            for word in words:
+                word_lower = word.lower()
+                if word_lower not in seen:
+                    seen.add(word_lower)
+                    unique_words.append(word)
+
+            # 2) 語数制限（右側から削除）
+            if len(unique_words) > max_words_per_phrase:
+                unique_words = unique_words[:max_words_per_phrase]
+
+            # 再構成
+            cleansed_phrase = ' '.join(unique_words)
+            if cleansed_phrase:
+                cleansed_phrases.append(cleansed_phrase)
+
+        # 3) 総語数チェック
+        total_words = sum(len(phrase.split()) for phrase in cleansed_phrases)
+
+        # 総語数が上限を超えている場合、末尾のフレーズから削除/短縮
+        while total_words > max_total_words and cleansed_phrases:
+            # 最後のフレーズを削除
+            removed_phrase = cleansed_phrases.pop()
+            total_words -= len(removed_phrase.split())
+            print(f"総語数制限のためフレーズを削除: {removed_phrase}")
+
+        return cleansed_phrases
 
     def extract_keywords_strict(self, title: str, include_brand: bool, brand: str) -> List[str]:
         """厳しめモード：ほぼ同じ商品を探すためのキーワード抽出（タイトルの単語をそのまま使う）"""
@@ -503,9 +642,16 @@ class KeywordExtractor:
             instruction = template['instructions'].get(mode, template['instructions']['moderate'])
 
             # ブランド名の扱いを指定
-            brand_instruction = ""
-            if not include_brand and brand:
-                brand_instruction = f"\n注意: '{brand}'はキーワードに含めないでください。"
+            if include_brand:
+                brand_instruction = """【ブランド名の扱い】
+できるだけブランド偏重を避ける。カテゴリ/商品ジャンルを最優先し、ブランドは検索で明確な差が出る場合のみ含める。
+
+・アパレル・グッズ・コラボ系で、ブランド/チーム/コラボ名を入れると検索精度が上がる場合（例: "New Era", "レッドブルレーシング"）は標準/厳しめでのみ採用可（緩めでは原則不採用）
+・フットウェアや学用品など汎用品では、ブランドよりジャンル（例: "スクールシューズ"）やコレクション名（例: "LOWMEL"）を優先
+・電子機器は、商品ジャンル＋主要仕様/シリーズ名を優先し、メーカー名は原則不要。ただしシリーズ名がブランドと不可分（例: "KRAKEN"がNZXTの固有シリーズ）の場合、シリーズ名は可・メーカー名は不要"""
+            else:
+                brand_instruction = """【ブランド名の扱い】
+ブランド名・メーカー名は一切含めないでください。カテゴリ/商品ジャンル/コレクション名/主要特徴のみを抽出してください。"""
 
             # プロンプトをフォーマット
             prompt = template['base_prompt'].format(
@@ -514,11 +660,27 @@ class KeywordExtractor:
                 brand_instruction=brand_instruction
             )
 
+            # デバッグ: プロンプトの最初の200文字を出力
+            print(f"\n使用中のプロンプト（最初の200文字）:\n{prompt[:200]}...\n")
+
             # Gemini APIを呼び出し
             response = self.gemini_model.generate_content(prompt)
 
             # レスポンスをパース
             keywords_text = response.text.strip()
+
+            # AIの応答が空の場合
+            if not keywords_text:
+                print(f"AIの応答が空でした。タイトル: {title[:50]}...")
+                # フォールバック処理
+                if mode == 'strict':
+                    return self.extract_keywords_strict(title, include_brand, brand)
+                elif mode == 'moderate':
+                    return self.extract_keywords_moderate(title, include_brand, brand)
+                else:
+                    return self.extract_keywords_loose(title, include_brand, brand)
+
+            print(f"AIレスポンス: {keywords_text}")
             keywords = [kw.strip() for kw in keywords_text.split(',')]
 
             # ブランド名を含める場合は先頭に追加
@@ -534,7 +696,32 @@ class KeywordExtractor:
                 print(f"AIキーワード検証: {len(keywords)}個中{len(validated_keywords)}個が有効でした")
                 print(f"無効なキーワード: {[kw for kw in keywords if kw not in validated_keywords]}")
 
-            return validated_keywords
+            # 検証後もキーワードが空の場合はフォールバック
+            if not validated_keywords:
+                print(f"検証後にキーワードが0個になりました。フォールバックします。")
+                if mode == 'strict':
+                    return self.extract_keywords_strict(title, include_brand, brand)
+                elif mode == 'moderate':
+                    return self.extract_keywords_moderate(title, include_brand, brand)
+                else:
+                    return self.extract_keywords_loose(title, include_brand, brand)
+
+            # キーワードのクレンジング（重複削除・語数制限）
+            cleansed_keywords = self.cleanse_keywords(validated_keywords, mode)
+            if len(cleansed_keywords) < len(validated_keywords):
+                print(f"キーワードクレンジング: {len(validated_keywords)}個中{len(cleansed_keywords)}個に整理しました")
+
+            # クレンジング後もキーワードが空の場合はフォールバック
+            if not cleansed_keywords:
+                print(f"クレンジング後にキーワードが0個になりました。フォールバックします。")
+                if mode == 'strict':
+                    return self.extract_keywords_strict(title, include_brand, brand)
+                elif mode == 'moderate':
+                    return self.extract_keywords_moderate(title, include_brand, brand)
+                else:
+                    return self.extract_keywords_loose(title, include_brand, brand)
+
+            return cleansed_keywords
 
         except Exception as e:
             print(f"AIキーワード抽出エラー: {e}")
@@ -919,6 +1106,41 @@ class CuteKeywordExtractorGUI:
         if "停止" in text or "再開" in text:
             return {'canvas': canvas, 'rect_id': rect_id, 'text_id': text_id}
 
+    def on_process_mode_change(self):
+        """処理モード切り替え時の処理"""
+        mode = self.process_mode.get()
+
+        if mode == 'brand':
+            # ブランド名取得モード: キーワード抽出関連の設定を無効化
+            self._disable_frame(self.trans_frame)
+            self._disable_frame(self.extract_frame)
+            self._disable_frame(self.brand_frame)
+            self._disable_frame(self.ai_frame)
+        else:
+            # キーワード抽出モード: すべての設定を有効化
+            self._enable_frame(self.trans_frame)
+            self._enable_frame(self.extract_frame)
+            self._enable_frame(self.brand_frame)
+            self._enable_frame(self.ai_frame)
+
+    def _disable_frame(self, frame):
+        """フレーム内のすべてのウィジェットを無効化"""
+        for child in frame.winfo_children():
+            if isinstance(child, (tk.Radiobutton, tk.Checkbutton, ttk.Combobox)):
+                child.configure(state='disabled')
+            elif hasattr(child, 'winfo_children'):
+                self._disable_frame(child)
+
+    def _enable_frame(self, frame):
+        """フレーム内のすべてのウィジェットを有効化"""
+        for child in frame.winfo_children():
+            if isinstance(child, (tk.Radiobutton, tk.Checkbutton)):
+                child.configure(state='normal')
+            elif isinstance(child, ttk.Combobox):
+                child.configure(state='readonly')
+            elif hasattr(child, 'winfo_children'):
+                self._enable_frame(child)
+
     def setup_ui(self):
         """UIのセットアップ"""
         # メインタイトル
@@ -958,9 +1180,50 @@ class CuteKeywordExtractorGUI:
                 bg=self.colors['bg_secondary'],
                 fg=self.colors['text_primary']).pack(pady=15)
 
+        # 処理モード選択
+        process_mode_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
+        process_mode_frame.pack(fill='x', padx=20, pady=10)
+
+        tk.Label(process_mode_frame,
+                text="処理モード",
+                font=self.get_scaled_font('label'),
+                bg=self.colors['bg_secondary'],
+                fg=self.colors['text_secondary']).pack(anchor='w')
+
+        self.process_mode = tk.StringVar(value='keyword')
+
+        # キーワード抽出モード
+        keyword_rb = tk.Radiobutton(process_mode_frame,
+                                   text="キーワード抽出",
+                                   variable=self.process_mode,
+                                   value='keyword',
+                                   bg=self.colors['bg_secondary'],
+                                   fg=self.colors['text_primary'],
+                                   selectcolor=self.colors['bg_main'],
+                                   activebackground=self.colors['bg_secondary'],
+                                   activeforeground=self.colors['text_primary'],
+                                   font=self.get_scaled_font('label'),
+                                   command=self.on_process_mode_change)
+        keyword_rb.pack(anchor='w', pady=2)
+
+        # ブランド名取得モード
+        brand_rb = tk.Radiobutton(process_mode_frame,
+                                 text="ブランド名取得",
+                                 variable=self.process_mode,
+                                 value='brand',
+                                 bg=self.colors['bg_secondary'],
+                                 fg=self.colors['text_primary'],
+                                 selectcolor=self.colors['bg_main'],
+                                 activebackground=self.colors['bg_secondary'],
+                                 activeforeground=self.colors['text_primary'],
+                                 font=self.get_scaled_font('label'),
+                                 command=self.on_process_mode_change)
+        brand_rb.pack(anchor='w', pady=2)
+
         # 翻訳モード
         trans_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
         trans_frame.pack(fill='x', padx=20, pady=10)
+        self.trans_frame = trans_frame  # 後で有効/無効化するために保存
 
         labelTrans = tk.Label(trans_frame,
                 text="翻訳モード",
@@ -982,6 +1245,7 @@ class CuteKeywordExtractorGUI:
         # 抽出モード設定
         extract_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
         extract_frame.pack(fill='x', padx=20, pady=10)
+        self.extract_frame = extract_frame  # 後で有効/無効化するために保存
 
         label2 = tk.Label(extract_frame,
                 text="抽出モード",
@@ -1029,6 +1293,7 @@ class CuteKeywordExtractorGUI:
         # ブランド名オプション
         brand_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
         brand_frame.pack(fill='x', padx=20, pady=10, anchor='w')
+        self.brand_frame = brand_frame  # 後で有効/無効化するために保存
 
         self.include_brand = tk.BooleanVar(value=True)
 
@@ -1057,6 +1322,7 @@ class CuteKeywordExtractorGUI:
         # AI使用オプション
         ai_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
         ai_frame.pack(fill='x', padx=20, pady=10, anchor='w')
+        self.ai_frame = ai_frame  # 後で有効/無効化するために保存
 
         self.use_ai = tk.BooleanVar(value=self.extractor.use_ai)
 
@@ -1146,11 +1412,46 @@ class CuteKeywordExtractorGUI:
                                      fg=self.colors['text_primary'])
         self.progress_label.pack(anchor='w')
 
-        self.progress_bar = ttk.Progressbar(progress_frame,
-                                          mode='determinate',
-                                          length=250,
-                                          style='Cute.Horizontal.TProgressbar')
-        self.progress_bar.pack(fill='x', pady=2)
+        # カスタムプログレスバー（細く、角丸）
+        self.progress_canvas = tk.Canvas(progress_frame,
+                                        height=12,
+                                        bg=self.colors['bg_tertiary'],
+                                        highlightthickness=0)
+        self.progress_canvas.pack(fill='x', pady=2)
+
+        # 角丸の四角形を描画する関数
+        def create_rounded_rect_for_progress(canvas, x1, y1, x2, y2, radius=4, **kwargs):
+            points = [
+                x1 + radius, y1,
+                x2 - radius, y1,
+                x2, y1,
+                x2, y1 + radius,
+                x2, y2 - radius,
+                x2, y2,
+                x2 - radius, y2,
+                x1 + radius, y2,
+                x1, y2,
+                x1, y2 - radius,
+                x1, y1 + radius,
+                x1, y1
+            ]
+            return canvas.create_polygon(points, smooth=True, **kwargs)
+
+        # 左右のパディング
+        padding = 5
+
+        # 背景バー（角丸）
+        self.progress_bg_rect = create_rounded_rect_for_progress(
+            self.progress_canvas,
+            padding, 2, 250 - padding, 10,
+            radius=4,
+            fill=self.colors['bg_main'],
+            outline=''
+        )
+
+        # 進捗バー（角丸）- 初期状態では非表示
+        self.progress_fill_rect = None
+        self.progress_padding = padding  # 保存しておく
 
         self.progress_text = tk.Label(progress_frame,
                                     text="0 / 0 (0%)",
@@ -1158,6 +1459,14 @@ class CuteKeywordExtractorGUI:
                                     bg=self.colors['bg_tertiary'],
                                     fg=self.colors['text_primary'])
         self.progress_text.pack(anchor='w')
+
+        # 残り時間表示
+        self.time_remaining_label = tk.Label(progress_frame,
+                                            text="",
+                                            font=self.get_scaled_font('small'),
+                                            bg=self.colors['bg_tertiary'],
+                                            fg=self.colors['text_secondary'])
+        self.time_remaining_label.pack(anchor='w')
 
         # 右側パネル（メインコンテンツ）
         right_panel = tk.Frame(content_frame, bg=self.colors['bg_main'])
@@ -1222,11 +1531,24 @@ class CuteKeywordExtractorGUI:
 
     def display_result(self, result):
         """結果を表示に追加"""
+        # ウィジェットの存在確認
+        if not hasattr(self, 'result_tree'):
+            return
+
+        try:
+            # ウィジェットが有効かチェック
+            self.result_tree.winfo_exists()
+        except:
+            return
+
         keywords_str = ' '.join(result['keywords'])
         translated_keywords_str = ' '.join(result['translated_keywords'])
 
         # 交互に背景色を変える
-        row_index = len(self.result_tree.get_children())
+        try:
+            row_index = len(self.result_tree.get_children())
+        except:
+            return
         tags = ('oddrow',) if row_index % 2 == 0 else ('evenrow',)
 
         # データの各値にパディングを追加（視覚的な区切り）
@@ -1477,6 +1799,87 @@ class CuteKeywordExtractorGUI:
         # セルハイライト用の設定
         self.result_tree.tag_configure('cell_highlight', background='#BBDEFB', foreground='#1976D2')  # より目立つ青色
 
+    def update_progress(self, current, total, start_time=None):
+        """プログレスバーを更新（角丸、細いバー）"""
+        # キャンバスの幅を取得
+        canvas_width = self.progress_canvas.winfo_width()
+        if canvas_width <= 1:  # まだ描画されていない場合
+            canvas_width = 250
+
+        # 進捗率を計算
+        if total > 0:
+            progress = current / total
+        else:
+            progress = 0
+
+        # パディングを考慮した幅を計算
+        padding = self.progress_padding
+        usable_width = canvas_width - (padding * 2)
+        fill_width = int(usable_width * progress)
+
+        # 角丸の四角形を描画する関数
+        def create_rounded_rect_coords(x1, y1, x2, y2, radius=4):
+            points = [
+                x1 + radius, y1,
+                x2 - radius, y1,
+                x2, y1,
+                x2, y1 + radius,
+                x2, y2 - radius,
+                x2, y2,
+                x2 - radius, y2,
+                x1 + radius, y2,
+                x1, y2,
+                x1, y2 - radius,
+                x1, y1 + radius,
+                x1, y1
+            ]
+            return points
+
+        # 背景バーを更新（角丸）
+        bg_coords = create_rounded_rect_coords(padding, 2, canvas_width - padding, 10, radius=4)
+        self.progress_canvas.coords(self.progress_bg_rect, *bg_coords)
+
+        # 進捗バーを削除して再描画（角丸）
+        if self.progress_fill_rect:
+            self.progress_canvas.delete(self.progress_fill_rect)
+            self.progress_fill_rect = None
+
+        if fill_width > 8:  # 最小幅8px以上の場合のみ描画
+            fill_coords = create_rounded_rect_coords(
+                padding, 2,
+                padding + fill_width, 10,
+                radius=4
+            )
+            self.progress_fill_rect = self.progress_canvas.create_polygon(
+                fill_coords,
+                fill=self.colors['accent'],
+                outline='',
+                smooth=True
+            )
+
+        # テキスト更新
+        percentage = int(progress * 100)
+        self.progress_text.config(text=f"{current} / {total} ({percentage}%)")
+
+        # 残り時間を計算
+        if start_time and current > 0:
+            elapsed_time = time.time() - start_time
+            avg_time_per_item = elapsed_time / current
+            remaining_items = total - current
+            remaining_seconds = avg_time_per_item * remaining_items
+
+            if remaining_seconds > 60:
+                remaining_minutes = int(remaining_seconds / 60)
+                self.time_remaining_label.config(text=f"残り時間: 約 {remaining_minutes} 分")
+            elif remaining_seconds > 0:
+                self.time_remaining_label.config(text=f"残り時間: 約 {int(remaining_seconds)} 秒")
+            else:
+                self.time_remaining_label.config(text="")
+        else:
+            self.time_remaining_label.config(text="")
+
+        self.root.update()
+
     def extract_keywords(self):
         """キーワード抽出処理"""
         # 結果をクリア
@@ -1490,18 +1893,32 @@ class CuteKeywordExtractorGUI:
         self.result_status.config(text="処理中...", fg=self.colors['text_primary'])
 
         # プログレスバーを初期化
-        self.progress_bar['value'] = 0
-        self.progress_text.config(text="0 / 0 (0%)")
+        self.update_progress(0, 0)
         self.root.update()
 
-        # 入力取得
+        # 入力取得（ASINを大文字に正規化）
         input_text = self.input_text.get('1.0', 'end-1c')
-        inputs = [line.strip() for line in input_text.split('\n') if line.strip()]
+        inputs = [line.strip().upper() for line in input_text.split('\n') if line.strip()]
 
         if not inputs:
             self.result_status.config(text="入力なし", fg=self.colors['text_primary'])
             messagebox.showwarning("警告", "ASINを入力してください")
             return
+
+        # ASINの長さをチェック
+        valid_inputs = []
+        for asin in inputs:
+            if len(asin) == 10:
+                valid_inputs.append(asin)
+            else:
+                print(f"警告: 無効なASIN長さ: {asin} (長さ: {len(asin)})")
+
+        if not valid_inputs:
+            self.result_status.config(text="有効なASINがありません", fg=self.colors['text_primary'])
+            messagebox.showwarning("警告", "有効なASINがありません（ASINは10文字である必要があります）")
+            return
+
+        inputs = valid_inputs
 
         # 翻訳モードの解析
         translate_map = {
@@ -1528,9 +1945,11 @@ class CuteKeywordExtractorGUI:
             results = []
             processed_count = 0  # 実際に処理された件数
 
-            # プログレスバーの最大値を設定
-            self.progress_bar['maximum'] = total_count
-            self.progress_text.config(text=f"0 / {total_count} (0%)")
+            # 処理開始時刻を記録
+            start_time = time.time()
+
+            # プログレスバーの初期化
+            self.update_progress(0, total_count, start_time)
             self.root.update()
 
             # ASIN専用処理（商品タイトルモードを削除）
@@ -1546,65 +1965,110 @@ class CuteKeywordExtractorGUI:
                 if not self.processing:
                     break
 
+                # ステータス表示（処理開始）
                 self.result_status.config(
-                    text=f"処理中... {i}/{total_count} (ASIN: {asin})",
+                    text=f"処理中... {processed_count}/{total_count} (ASIN: {asin})",
                     fg=self.colors['text_primary']
                 )
-                # 統計情報も更新
-                self.stats_label.config(
-                    text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: {i}/{total_count} 処理中..."
-                )
-                # プログレスバーを更新
-                self.progress_bar['value'] = i
-                progress_percent = int((i / total_count) * 100)
-                self.progress_text.config(text=f"{i} / {total_count} ({progress_percent}%)")
                 self.root.update()
 
                 # ASINから商品タイトルとブランド名を取得
                 region = self.amazon_region.get()
                 title, brand_from_asin = self.extractor.fetch_product_info_from_asin(asin, region)
+
+                # 結果オブジェクトを初期化
+                result = None
+
+                # 処理モードで分岐
+                process_mode = self.process_mode.get()
+
                 if not title:
                     print(f"タイトル取得失敗: {asin}")
-                    continue
+                    # タイトル取得失敗時も空の結果を作成
+                    result = {
+                        'asin': asin,
+                        'original_title': f"取得失敗: {asin}",
+                        'brand': '',
+                        'keywords': [],
+                        'translated_keywords': []
+                    }
+                elif process_mode == 'brand':
+                    # ブランド名取得モード: ASINとブランド名だけを表示
+                    result = {
+                        'asin': asin,
+                        'original_title': '',  # 商品タイトルは表示しない
+                        'brand': brand_from_asin if brand_from_asin else '',
+                        'keywords': [],
+                        'translated_keywords': []
+                    }
 
-                # キーワード抽出処理
-                try:
-                    result = self.extractor.process_single_title(
-                        title,
-                        self.extract_mode.get(),
-                        translate_mode,
-                        self.include_brand.get()
+                    # ブランド名取得モードは処理が速いため、追加の待機時間を設ける
+                    import random
+                    wait_time = random.uniform(10, 15)
+                    print(f"次のリクエストまで {wait_time:.1f}秒待機中...")
+                    time.sleep(wait_time)
+                else:
+                    # キーワード抽出モード
+                    try:
+                        result = self.extractor.process_single_title(
+                            title,
+                            self.extract_mode.get(),
+                            translate_mode,
+                            self.include_brand.get()
+                        )
+
+                        # ASINから取得したブランド名がある場合はそれを優先
+                        if brand_from_asin:
+                            result['brand'] = brand_from_asin
+
+                        result['asin'] = asin  # ASINも結果に保存
+
+                    except Exception as e:
+                        print(f"process_single_title エラー: {asin} -> {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # エラー時も空の結果を作成
+                        result = {
+                            'asin': asin,
+                            'original_title': title,
+                            'brand': brand_from_asin if brand_from_asin else '',
+                            'keywords': [],
+                            'translated_keywords': []
+                        }
+
+                # 結果を追加（エラーでも追加）
+                if result:
+                    results.append(result)
+                    processed_count += 1
+
+                    # ブランド数カウント
+                    if result.get('brand'):
+                        brand_count += 1
+
+                    # リアルタイム表示
+                    self.display_result(result)
+
+                    # 処理完了後にプログレスバーと統計情報を更新
+                    self.update_progress(processed_count, total_count, start_time)
+                    self.stats_label.config(
+                        text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: 処理中..."
                     )
-                except Exception as e:
-                    print(f"process_single_title エラー: {asin} -> {e}")
-                    continue
-
-                # ASINから取得したブランド名がある場合はそれを優先
-                if brand_from_asin:
-                    result['brand'] = brand_from_asin
-
-                result['asin'] = asin  # ASINも結果に保存
-                results.append(result)
-                processed_count += 1
-
-                # ブランド数カウント
-                if result['brand']:
-                    brand_count += 1
-
-                # リアルタイム表示
-                self.display_result(result)
+                    self.result_status.config(
+                        text=f"処理中... {processed_count}/{total_count}",
+                        fg=self.colors['text_primary']
+                    )
 
             # 統計更新（最終）
             self.stats_label.config(
-                text=f"件数: {len(results)}\nブランド数: {brand_count}\n処理状況: 完了"
+                text=f"件数: {processed_count}\nブランド数: {brand_count}\n処理状況: 完了"
             )
 
             # プログレスバーを完了状態に
-            self.progress_bar['value'] = total_count
-            self.progress_text.config(text=f"{total_count} / {total_count} (100%)")
+            self.update_progress(processed_count, total_count, start_time)
+            self.time_remaining_label.config(text="")  # 残り時間をクリア
 
             # ステータス更新
-            self.result_status.config(text=f"✓ {len(results)}件処理完了", fg=self.colors['text_primary'])
+            self.result_status.config(text=f"✓ {processed_count}件処理完了", fg=self.colors['text_primary'])
 
         except Exception as e:
             self.result_status.config(text="エラー発生", fg=self.colors['text_primary'])
@@ -1760,13 +2224,111 @@ class CuteKeywordExtractorGUI:
                 bg=self.colors['bg_main'],
                 fg=self.colors['text_primary']).pack(side='left', padx=(0, 10))
 
-        template_var = tk.StringVar(value=self.extractor.prompt_data.get('current_template', 'default'))
+        template_var = tk.StringVar(value=self.extractor.prompt_data.get('current_template', 'デフォルト'))
         template_combo = ttk.Combobox(template_frame,
                                       textvariable=template_var,
                                       values=list(self.extractor.prompt_data['templates'].keys()),
                                       state='readonly',
-                                      width=30)
-        template_combo.pack(side='left')
+                                      width=25)
+        template_combo.pack(side='left', padx=(0, 10))
+
+        # テンプレート管理ボタン
+        def add_template():
+            """新しいテンプレートを追加"""
+            # 名前入力ダイアログ
+            from tkinter import simpledialog
+            name = simpledialog.askstring("新規テンプレート", "テンプレート名を入力してください:")
+            if name and name.strip():
+                name = name.strip()
+                if name in self.extractor.prompt_data['templates']:
+                    messagebox.showwarning("警告", "同じ名前のテンプレートが既に存在します")
+                    return
+                if name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル']):
+                    messagebox.showwarning("警告", "デフォルトテンプレートと同じ名前は使用できません")
+                    return
+
+                # デフォルトテンプレートをコピーして新規作成
+                default_template = self.extractor.prompt_data['templates']['デフォルト']
+                self.extractor.prompt_data['templates'][name] = {
+                    'name': name,
+                    'base_prompt': default_template['base_prompt'],
+                    'instructions': default_template['instructions'].copy()
+                }
+                # コンボボックスを更新
+                template_combo['values'] = list(self.extractor.prompt_data['templates'].keys())
+                template_var.set(name)
+                load_template()
+                messagebox.showinfo("成功", f"テンプレート '{name}' を作成しました")
+
+        def rename_template():
+            """テンプレート名を変更"""
+            current_name = template_var.get()
+            if current_name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル']):
+                messagebox.showwarning("警告", "デフォルトテンプレートの名前は変更できません")
+                return
+
+            from tkinter import simpledialog
+            new_name = simpledialog.askstring("名前変更", f"'{current_name}' の新しい名前を入力してください:", initialvalue=current_name)
+            if new_name and new_name.strip():
+                new_name = new_name.strip()
+                if new_name == current_name:
+                    return
+                if new_name in self.extractor.prompt_data['templates']:
+                    messagebox.showwarning("警告", "同じ名前のテンプレートが既に存在します")
+                    return
+                if new_name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル']):
+                    messagebox.showwarning("警告", "デフォルトテンプレートと同じ名前は使用できません")
+                    return
+
+                # 名前を変更
+                self.extractor.prompt_data['templates'][new_name] = self.extractor.prompt_data['templates'][current_name]
+                self.extractor.prompt_data['templates'][new_name]['name'] = new_name
+                del self.extractor.prompt_data['templates'][current_name]
+
+                # current_templateも更新
+                if self.extractor.prompt_data.get('current_template') == current_name:
+                    self.extractor.prompt_data['current_template'] = new_name
+
+                # コンボボックスを更新
+                template_combo['values'] = list(self.extractor.prompt_data['templates'].keys())
+                template_var.set(new_name)
+                messagebox.showinfo("成功", f"テンプレート名を '{new_name}' に変更しました")
+
+        def delete_template():
+            """テンプレートを削除"""
+            current_name = template_var.get()
+            if current_name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル']):
+                messagebox.showwarning("警告", "デフォルトテンプレートは削除できません")
+                return
+
+            if messagebox.askyesno("確認", f"テンプレート '{current_name}' を削除しますか？"):
+                del self.extractor.prompt_data['templates'][current_name]
+
+                # current_templateをデフォルトに戻す
+                if self.extractor.prompt_data.get('current_template') == current_name:
+                    self.extractor.prompt_data['current_template'] = 'デフォルト'
+
+                # コンボボックスを更新
+                template_combo['values'] = list(self.extractor.prompt_data['templates'].keys())
+                template_var.set('デフォルト')
+                load_template()
+                messagebox.showinfo("成功", f"テンプレート '{current_name}' を削除しました")
+
+        # ボタンを追加
+        tk.Button(template_frame, text="➕ 追加", command=add_template,
+                 bg=self.colors['accent'], fg='white',
+                 font=self.get_scaled_font('small'),
+                 relief='flat', padx=10, pady=3).pack(side='left', padx=2)
+
+        tk.Button(template_frame, text="✏️ 名前変更", command=rename_template,
+                 bg=self.colors['accent_hover'], fg='white',
+                 font=self.get_scaled_font('small'),
+                 relief='flat', padx=10, pady=3).pack(side='left', padx=2)
+
+        tk.Button(template_frame, text="🗑️ 削除", command=delete_template,
+                 bg='#e74c3c', fg='white',
+                 font=self.get_scaled_font('small'),
+                 relief='flat', padx=10, pady=3).pack(side='left', padx=2)
 
         # ベースプロンプト編集
         base_label = tk.Label(main_frame,
@@ -1817,6 +2379,8 @@ class CuteKeywordExtractorGUI:
         # 現在のテンプレートの内容をロード
         def load_template():
             template_name = template_var.get()
+            is_default = template_name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル'])
+
             if template_name in self.extractor.prompt_data['templates']:
                 template = self.extractor.prompt_data['templates'][template_name]
                 base_text.delete('1.0', tk.END)
@@ -1825,6 +2389,18 @@ class CuteKeywordExtractorGUI:
                 for mode_key, text_widget in instruction_texts.items():
                     text_widget.delete('1.0', tk.END)
                     text_widget.insert('1.0', template['instructions'].get(mode_key, ''))
+
+                # デフォルトテンプレートの場合は編集を無効化
+                if is_default:
+                    base_text.config(state='disabled', bg='#f0f0f0')
+                    for text_widget in instruction_texts.values():
+                        text_widget.config(state='disabled', bg='#f0f0f0')
+                    base_label.config(text="ベースプロンプト（デフォルトテンプレートは編集できません）:")
+                else:
+                    base_text.config(state='normal', bg=self.colors['input_bg'])
+                    for text_widget in instruction_texts.values():
+                        text_widget.config(state='normal', bg=self.colors['input_bg'])
+                    base_label.config(text="ベースプロンプト（{title}, {instruction}, {brand_instruction}が置換されます）:")
 
         # テンプレート選択時のイベント
         template_combo.bind('<<ComboboxSelected>>', lambda e: load_template())
@@ -1839,6 +2415,11 @@ class CuteKeywordExtractorGUI:
         def save_template():
             """テンプレートを保存"""
             template_name = template_var.get()
+
+            # デフォルトテンプレートは保存できない
+            if template_name in self.extractor.prompt_data.get('default_templates', ['デフォルト', 'シンプル']):
+                messagebox.showwarning("警告", "デフォルトテンプレートは保存できません。\n編集したい場合は、新しいテンプレートを作成してください。")
+                return
 
             # テンプレートデータを更新
             self.extractor.prompt_data['templates'][template_name] = {
