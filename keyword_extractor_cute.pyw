@@ -5,11 +5,123 @@ from typing import List, Tuple, Dict
 import json
 import os
 import time
+import random
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+
+
+# ============================================================================
+# ヘルパークラス・関数
+# ============================================================================
+
+class RateLimiter:
+    """スクレイピングのレート制限を管理するクラス"""
+
+    def __init__(self, min_delay=4.0, max_delay=9.0, penalty=30.0):
+        """
+        Args:
+            min_delay: 最小待機時間（秒）
+            max_delay: 最大待機時間（秒）
+            penalty: ペナルティ時の追加待機時間（秒）
+        """
+        self.min = min_delay
+        self.max = max_delay
+        self.penalty = penalty
+        self.last_request_time = 0
+        self.multiplier = 1.0  # 待機時間の倍率
+        self.consecutive_errors = 0
+
+    def wait(self):
+        """適切な待機時間を計算して待機"""
+        target_delay = random.uniform(self.min, self.max) * self.multiplier
+        elapsed = time.perf_counter() - self.last_request_time
+
+        if elapsed < target_delay:
+            wait_time = target_delay - elapsed
+            print(f"[WAIT] レート制限: {wait_time:.1f}秒待機中...")
+            time.sleep(wait_time)
+
+        self.last_request_time = time.perf_counter()
+
+    def penalize(self, hard=False):
+        """エラー検出時に待機時間を延長"""
+        if hard:
+            # CAPTCHA検出時などの重度のペナルティ
+            self.multiplier = min(4.0, self.multiplier * 2.0)
+            self.consecutive_errors += 1
+            print(f"[WARNING] 重度エラー検出: 待機時間を{self.multiplier:.1f}倍に延長")
+            # 即座にペナルティ待機
+            time.sleep(self.penalty)
+        else:
+            # 429エラーなどの軽度のペナルティ
+            self.multiplier = min(4.0, self.multiplier * 1.5)
+            self.consecutive_errors += 1
+            print(f"[WARNING] エラー検出: 待機時間を{self.multiplier:.1f}倍に延長")
+
+    def recover(self):
+        """成功時に待機時間を回復"""
+        if self.multiplier > 1.0:
+            self.multiplier = max(1.0, self.multiplier * 0.5)
+            self.consecutive_errors = 0
+            print(f"[OK] 成功: 待機時間を{self.multiplier:.1f}倍に回復")
+
+
+def get_random_user_agent() -> str:
+    """ランダムなUser-Agentを返す"""
+    user_agents = [
+        # Chrome on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        # Chrome on Mac
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        # Firefox on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+        # Firefox on Mac
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0',
+        # Safari on Mac
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        # Edge on Windows
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+    ]
+    return random.choice(user_agents)
+
+
+def create_session_with_retry(max_retries=5, backoff_factor=1.2) -> requests.Session:
+    """リトライ設定済みのrequests.Sessionを作成"""
+    session = requests.Session()
+
+    # リトライ戦略の設定
+    retry_strategy = Retry(
+        total=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False  # ステータスコードでの例外を抑制
+    )
+
+    # HTTPアダプターにリトライ戦略を適用
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
+
+# ============================================================================
+# メインクラス
+# ============================================================================
 
 class KeywordExtractor:
     def __init__(self):
@@ -17,8 +129,59 @@ class KeywordExtractor:
         self.common_brands = self.load_brands()
         self.gemini_model = None
         self.use_ai = False
+
+        # config.jsonからスクレイピング設定を読み込み
+        self.scraping_config = self.load_scraping_config()
+
+        # スクレイピング用のセッションとレート制限
+        self.session = create_session_with_retry(
+            max_retries=self.scraping_config['max_retries'],
+            backoff_factor=self.scraping_config['backoff_factor']
+        )
+        self.rate_limiter = RateLimiter(
+            min_delay=self.scraping_config['min_delay'],
+            max_delay=self.scraping_config['max_delay'],
+            penalty=self.scraping_config['penalty_delay']
+        )
+
+        # メトリクス追跡
+        self.scraping_stats = {
+            'total': 0,
+            'success': 0,
+            'failed': 0,
+            'captcha_count': 0,
+            'http_errors': 0
+        }
+
         self.setup_gemini()
         self.load_prompt_templates()
+
+    def load_scraping_config(self) -> Dict:
+        """config.jsonからスクレイピング設定を読み込み"""
+        config_path = "config.json"
+        default_config = {
+            'min_delay': 4.0,
+            'max_delay': 9.0,
+            'penalty_delay': 30.0,
+            'batch_size': 25,
+            'batch_cooldown': 60,
+            'max_retries': 5,
+            'backoff_factor': 1.2
+        }
+
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    scraping_config = config.get('scraping', default_config)
+                    print(f"[OK] スクレイピング設定を読み込みました: batch_size={scraping_config.get('batch_size')}, delay={scraping_config.get('min_delay')}-{scraping_config.get('max_delay')}秒")
+                    return scraping_config
+            else:
+                print(f"[INFO] config.jsonが見つかりません。デフォルト設定を使用します。")
+                return default_config
+        except Exception as e:
+            print(f"[WARNING] スクレイピング設定読み込みエラー: {e}。デフォルト設定を使用します。")
+            return default_config
 
     def load_brands(self) -> List[str]:
         """一般的なブランド名のリストを返す"""
@@ -197,22 +360,26 @@ class KeywordExtractor:
         return ""
 
     def fetch_product_info_from_asin(self, asin: str, region: str = "jp") -> tuple:
-        """ASINからAmazonの商品タイトルとブランド名を取得"""
-        import requests
-        from bs4 import BeautifulSoup
-        import time
-        import random
+        """ASINからAmazonの商品タイトルとブランド名を取得（改善版）"""
 
         if not asin:
             print(f"ASINが空です")
+            self.scraping_stats['failed'] += 1
             return "", ""
 
         asin = asin.strip().upper()  # ASINを大文字に正規化
         if len(asin) != 10:
             print(f"ASIN長さエラー: {asin} (長さ: {len(asin)})")
+            self.scraping_stats['failed'] += 1
             return "", ""
 
+        # メトリクス更新
+        self.scraping_stats['total'] += 1
+
         try:
+            # レート制限による待機
+            self.rate_limiter.wait()
+
             # Amazonの商品ページURL（地域に応じて変更）
             if region == "us":
                 url = f"https://www.amazon.com/dp/{asin}"
@@ -221,9 +388,9 @@ class KeywordExtractor:
                 url = f"https://www.amazon.co.jp/dp/{asin}"
                 accept_language = 'ja-JP,ja;q=0.9,en;q=0.8'
 
-            # シンプルなヘッダー設定
+            # ランダムなUser-Agentを使用
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'User-Agent': get_random_user_agent(),
                 'Accept-Language': accept_language,
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -231,18 +398,28 @@ class KeywordExtractor:
                 'Cache-Control': 'max-age=0'
             }
 
-            # ランダムな待機時間
-            time.sleep(random.uniform(1, 3))
+            # セッションを使用してリクエスト（自動リトライ機能付き）
+            response = self.session.get(url, headers=headers, timeout=15)
 
-            response = requests.get(url, headers=headers, timeout=15)
+            # HTTPエラーチェック（429などの場合）
+            if response.status_code == 429:
+                print(f"[WARNING] レート制限エラー (429) 検出: {asin}")
+                self.rate_limiter.penalize(hard=False)
+                self.scraping_stats['http_errors'] += 1
+                self.scraping_stats['failed'] += 1
+                return "", ""
+
             response.raise_for_status()
 
             soup = BeautifulSoup(response.content, 'html.parser')
 
             # CAPTCHAチェック
             if 'Robot Check' in response.text or 'captcha' in response.text.lower():
-                print(f"⚠️  CAPTCHA検出 ({asin}): Amazonがボット対策でブロックしています")
-                print(f"   対策: 数を減らす、時間を置く、VPN使用、またはブラウザで一度アクセスしてクッキーを取得")
+                print(f"[WARNING] CAPTCHA検出 ({asin}): Amazonがボット対策でブロックしています")
+                print(f"[INFO] 対策: しばらく待機してから再試行します...")
+                self.rate_limiter.penalize(hard=True)  # 重度のペナルティ
+                self.scraping_stats['captcha_count'] += 1
+                self.scraping_stats['failed'] += 1
                 return "", ""
 
             # 商品タイトルを取得（複数のセレクターを試す）
@@ -260,11 +437,15 @@ class KeywordExtractor:
                 if title_element:
                     title = title_element.get_text().strip()
                     if title:
-                        print(f"タイトル取得成功 ({selector}): {title[:50]}...")
+                        # タイトルの文字を安全に表示（エラー回避）
+                        try:
+                            print(f"[OK] タイトル取得成功 ({selector}): {title[:50]}...")
+                        except UnicodeEncodeError:
+                            print(f"[OK] タイトル取得成功 ({selector})")
                         break
 
             if not title:
-                print(f"⚠️  タイトル取得失敗: {asin} (すべてのセレクターで失敗)")
+                print(f"[WARNING] タイトル取得失敗: {asin} (すべてのセレクターで失敗)")
 
             # ブランド名を取得（複数のセレクターを順に試す）
             brand = ""
@@ -289,33 +470,97 @@ class KeywordExtractor:
                     # 不要なテキストを除去
                     brand = brand_text.replace('にアクセス', '').replace('Visit the', '').replace('ブランド:', '').replace('Brand:', '').replace('Store', '').replace('のストアを表示', '').replace("'s Store", '').strip()
                     if brand:  # 空でない場合のみ採用
-                        print(f"ブランド取得成功 ({selector}): {brand}")
+                        try:
+                            print(f"[OK] ブランド取得成功 ({selector}): {brand}")
+                        except UnicodeEncodeError:
+                            print(f"[OK] ブランド取得成功 ({selector})")
                         break
 
             if not brand:
-                print(f"ℹ️  ブランド名なし: {asin}")
+                print(f"[INFO] ブランド名なし: {asin}")
+
+            # 成功時はレート制限を回復
+            if title or brand:
+                self.rate_limiter.recover()
+                self.scraping_stats['success'] += 1
+            else:
+                self.scraping_stats['failed'] += 1
 
             return title, brand
 
         except requests.exceptions.HTTPError as e:
             print(f"HTTP エラー ({asin}): {e.response.status_code} - {e}")
+            self.scraping_stats['http_errors'] += 1
+            self.scraping_stats['failed'] += 1
+            self.rate_limiter.penalize(hard=False)
             return "", ""
         except requests.exceptions.Timeout as e:
             print(f"タイムアウト エラー ({asin}): {e}")
+            self.scraping_stats['failed'] += 1
             return "", ""
         except requests.exceptions.RequestException as e:
             print(f"リクエスト エラー ({asin}): {e}")
+            self.scraping_stats['failed'] += 1
             return "", ""
         except Exception as e:
             print(f"予期しないエラー ({asin}): {type(e).__name__} - {e}")
             import traceback
             traceback.print_exc()
+            self.scraping_stats['failed'] += 1
             return "", ""
 
     def fetch_product_title_from_asin(self, asin: str) -> str:
         """後方互換性のためのメソッド"""
         title, _ = self.fetch_product_info_from_asin(asin)
         return title
+
+    # ============================================================================
+    # 進捗管理関数
+    # ============================================================================
+
+    def save_progress(self, processed_asins: List[str], filepath: str = ".progress.json"):
+        """処理済みASINをJSONファイルに保存"""
+        try:
+            progress_data = {
+                'processed_asins': processed_asins,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'stats': self.scraping_stats.copy()
+            }
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, indent=2, ensure_ascii=False)
+            print(f"[OK] 進捗保存: {len(processed_asins)}件 ({filepath})")
+        except Exception as e:
+            print(f"[WARNING] 進捗保存エラー: {e}")
+
+    def load_progress(self, filepath: str = ".progress.json") -> Dict:
+        """保存された進捗をJSONファイルから読み込み"""
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    progress_data = json.load(f)
+                print(f"[OK] 進捗読み込み: {len(progress_data.get('processed_asins', []))}件 ({filepath})")
+                return progress_data
+            else:
+                print(f"[INFO] 進捗ファイルが存在しません: {filepath}")
+                return {'processed_asins': [], 'stats': None}
+        except Exception as e:
+            print(f"[WARNING] 進捗読み込みエラー: {e}")
+            return {'processed_asins': [], 'stats': None}
+
+    def get_unprocessed_asins(self, all_asins: List[str], processed_asins: List[str]) -> List[str]:
+        """未処理のASINリストを返す"""
+        unprocessed = [asin for asin in all_asins if asin not in processed_asins]
+        print(f"[INFO] 未処理ASIN: {len(unprocessed)}件 / 全体: {len(all_asins)}件")
+        return unprocessed
+
+    def clear_progress(self, filepath: str = ".progress.json"):
+        """進捗ファイルを削除"""
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                print(f"[OK] 進捗ファイルを削除しました: {filepath}")
+        except Exception as e:
+            print(f"[WARNING] 進捗ファイル削除エラー: {e}")
 
     def load_prompt_templates(self):
         """プロンプトテンプレートを読み込み"""
@@ -734,28 +979,109 @@ class KeywordExtractor:
                 return self.extract_keywords_loose(title, include_brand, brand)
 
     def process_asins(self, asins: List[str], mode: str, translate_mode: str,
-                     include_brand: bool, region: str = "jp", use_ai: bool = None) -> List[Dict]:
-        """複数のASINを処理してタイトルとブランド名を取得後、キーワード抽出"""
+                     include_brand: bool, region: str = "jp", use_ai: bool = None,
+                     batch_size: int = 25, batch_cooldown: int = 60,
+                     enable_progress_save: bool = True,
+                     progress_callback=None,
+                     should_stop_callback=None) -> List[Dict]:
+        """複数のASINを処理してタイトルとブランド名を取得後、キーワード抽出（改善版）"""
         results = []
-        for asin in asins:
-            if not asin.strip():
-                continue
+        processed_asins = []
 
-            # ASINから商品タイトルとブランド名を取得
-            title, brand_from_asin = self.fetch_product_info_from_asin(asin.strip(), region)
-            if not title:
-                print(f"タイトル取得失敗: {asin}")
-                continue
+        # 進捗再開モードの確認
+        if enable_progress_save:
+            progress_data = self.load_progress()
+            already_processed = progress_data.get('processed_asins', [])
+            if already_processed:
+                print(f"[RESUME] 進捗再開モード: {len(already_processed)}件スキップ")
+                # すでに処理済みのASINはスキップ
+                asins_to_process = self.get_unprocessed_asins(asins, already_processed)
+            else:
+                asins_to_process = asins
+        else:
+            asins_to_process = asins
 
-            # 通常のタイトル処理と同じ処理を実行
-            result = self.process_single_title(title, mode, translate_mode, include_brand, use_ai)
+        total_asins = len(asins_to_process)
+        if total_asins == 0:
+            print("[OK] すべてのASINが処理済みです")
+            return results
 
-            # ASINから取得したブランド名がある場合はそれを優先
-            if brand_from_asin:
-                result['brand'] = brand_from_asin
+        print(f"[START] 処理開始: {total_asins}件のASIN（バッチサイズ: {batch_size}）")
 
-            result['asin'] = asin.strip()  # ASINも結果に保存
-            results.append(result)
+        # バッチ処理
+        for batch_idx, i in enumerate(range(0, total_asins, batch_size), 1):
+            batch_asins = asins_to_process[i:i+batch_size]
+            total_batches = (total_asins + batch_size - 1) // batch_size
+
+            print(f"\n[BATCH] バッチ {batch_idx}/{total_batches} 処理中... ({len(batch_asins)}件)")
+
+            for idx, asin in enumerate(batch_asins, 1):
+                # 停止チェック
+                if should_stop_callback and should_stop_callback():
+                    print("\n[STOP] ユーザーによる処理中断")
+                    return results
+
+                if not asin.strip():
+                    continue
+
+                asin = asin.strip()
+                current_index = i + idx
+                print(f"\n[{current_index}/{total_asins}] 処理中: {asin}")
+
+                # 進捗コールバック（処理開始）
+                if progress_callback:
+                    progress_callback('processing', current_index, total_asins, asin, None)
+
+                # ASINから商品タイトルとブランド名を取得
+                title, brand_from_asin = self.fetch_product_info_from_asin(asin, region)
+                if not title:
+                    print(f"[WARNING] タイトル取得失敗: {asin}")
+                    # 失敗してもprocessed_asinsに追加（無限ループ防止）
+                    processed_asins.append(asin)
+
+                    # 進捗コールバック（失敗）
+                    if progress_callback:
+                        failed_result = {
+                            'asin': asin,
+                            'original_title': f"取得失敗: {asin}",
+                            'brand': '',
+                            'keywords': [],
+                            'translated_keywords': []
+                        }
+                        progress_callback('failed', current_index, total_asins, asin, failed_result)
+                    continue
+
+                # 通常のタイトル処理と同じ処理を実行
+                result = self.process_single_title(title, mode, translate_mode, include_brand, use_ai)
+
+                # ASINから取得したブランド名がある場合はそれを優先
+                if brand_from_asin:
+                    result['brand'] = brand_from_asin
+
+                result['asin'] = asin  # ASINも結果に保存
+                results.append(result)
+                processed_asins.append(asin)
+
+                # 進捗保存（各ASIN処理後）
+                if enable_progress_save:
+                    all_processed = already_processed + processed_asins if enable_progress_save else processed_asins
+                    self.save_progress(all_processed)
+
+                # メトリクス表示
+                success_rate = (self.scraping_stats['success'] / self.scraping_stats['total'] * 100) if self.scraping_stats['total'] > 0 else 0
+                print(f"[PROGRESS] 進捗: {len(processed_asins)}/{total_asins} | 成功率: {success_rate:.1f}% | CAPTCHA: {self.scraping_stats['captcha_count']}回")
+
+                # 進捗コールバック（完了）
+                if progress_callback:
+                    progress_callback('completed', current_index, total_asins, asin, result)
+
+            # バッチ間のクールダウン（最後のバッチ以外）
+            if batch_idx < total_batches and batch_cooldown > 0:
+                print(f"\n[COOLDOWN] バッチ間クールダウン: {batch_cooldown}秒待機中...")
+                time.sleep(batch_cooldown)
+
+        print(f"\n[COMPLETE] 処理完了: {len(results)}件成功 / {total_asins}件")
+        print(f"[STATS] 最終メトリクス: 成功={self.scraping_stats['success']}, 失敗={self.scraping_stats['failed']}, CAPTCHA={self.scraping_stats['captcha_count']}")
 
         return results
 
@@ -1952,47 +2278,102 @@ class CuteKeywordExtractorGUI:
             self.update_progress(0, total_count, start_time)
             self.root.update()
 
-            # ASIN専用処理（商品タイトルモードを削除）
-            for i, asin in enumerate(inputs, 1):
-                if not self.processing:
-                    break
+            # 処理モードで分岐
+            process_mode = self.process_mode.get()
+            region = self.amazon_region.get()
 
+            # コールバック関数を定義
+            def progress_callback(status, current_index, total, asin, result):
+                """進捗コールバック"""
+                nonlocal processed_count, brand_count
+
+                if status == 'processing':
+                    # 処理開始時
+                    self.result_status.config(
+                        text=f"処理中... {current_index}/{total} (ASIN: {asin})",
+                        fg=self.colors['text_primary']
+                    )
+                    self.root.update()
+
+                elif status in ('completed', 'failed'):
+                    # 処理完了または失敗時
+                    if result:
+                        results.append(result)
+                        processed_count += 1
+
+                        # ブランド数カウント
+                        if result.get('brand'):
+                            brand_count += 1
+
+                        # リアルタイム表示
+                        self.display_result(result)
+
+                        # プログレスバーと統計情報を更新
+                        self.update_progress(processed_count, total_count, start_time)
+                        self.stats_label.config(
+                            text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: 処理中..."
+                        )
+                        self.result_status.config(
+                            text=f"処理中... {processed_count}/{total_count}",
+                            fg=self.colors['text_primary']
+                        )
+                        self.root.update()
+
+            def should_stop_callback():
+                """停止判定コールバック"""
                 # 一時停止チェック
                 while self.is_paused and self.processing:
                     self.root.update()
                     time.sleep(0.1)
 
-                if not self.processing:
-                    break
+                return not self.processing
 
-                # ステータス表示（処理開始）
-                self.result_status.config(
-                    text=f"処理中... {processed_count}/{total_count} (ASIN: {asin})",
-                    fg=self.colors['text_primary']
+            # キーワード抽出モードの場合は新しいprocess_asins()を使用
+            if process_mode == 'keyword':
+                print(f"\n[GUI] 新しいバッチ処理モードで実行します")
+                results = self.extractor.process_asins(
+                    asins=inputs,
+                    mode=self.extract_mode.get(),
+                    translate_mode=translate_mode,
+                    include_brand=self.include_brand.get(),
+                    region=region,
+                    use_ai=None,  # AIはextractor内で自動判定
+                    batch_size=self.extractor.scraping_config['batch_size'],
+                    batch_cooldown=self.extractor.scraping_config['batch_cooldown'],
+                    enable_progress_save=True,
+                    progress_callback=progress_callback,
+                    should_stop_callback=should_stop_callback
                 )
-                self.root.update()
+                processed_count = len(results)
+                for result in results:
+                    if result.get('brand'):
+                        brand_count += 1
 
-                # ASINから商品タイトルとブランド名を取得
-                region = self.amazon_region.get()
-                title, brand_from_asin = self.extractor.fetch_product_info_from_asin(asin, region)
+            # ブランド名取得モードの場合は従来の処理（特別な待機時間が必要）
+            else:
+                print(f"\n[GUI] ブランド名取得モードで実行します")
+                for i, asin in enumerate(inputs, 1):
+                    if not self.processing:
+                        break
 
-                # 結果オブジェクトを初期化
-                result = None
+                    # 一時停止チェック
+                    while self.is_paused and self.processing:
+                        self.root.update()
+                        time.sleep(0.1)
 
-                # 処理モードで分岐
-                process_mode = self.process_mode.get()
+                    if not self.processing:
+                        break
 
-                if not title:
-                    print(f"タイトル取得失敗: {asin}")
-                    # タイトル取得失敗時も空の結果を作成
-                    result = {
-                        'asin': asin,
-                        'original_title': f"取得失敗: {asin}",
-                        'brand': '',
-                        'keywords': [],
-                        'translated_keywords': []
-                    }
-                elif process_mode == 'brand':
+                    # ステータス表示
+                    self.result_status.config(
+                        text=f"処理中... {i}/{total_count} (ASIN: {asin})",
+                        fg=self.colors['text_primary']
+                    )
+                    self.root.update()
+
+                    # ASINから商品タイトルとブランド名を取得
+                    title, brand_from_asin = self.extractor.fetch_product_info_from_asin(asin, region)
+
                     # ブランド名取得モード: ASINとブランド名だけを表示
                     result = {
                         'asin': asin,
@@ -2002,42 +2383,7 @@ class CuteKeywordExtractorGUI:
                         'translated_keywords': []
                     }
 
-                    # ブランド名取得モードは処理が速いため、追加の待機時間を設ける
-                    import random
-                    wait_time = random.uniform(10, 15)
-                    print(f"次のリクエストまで {wait_time:.1f}秒待機中...")
-                    time.sleep(wait_time)
-                else:
-                    # キーワード抽出モード
-                    try:
-                        result = self.extractor.process_single_title(
-                            title,
-                            self.extract_mode.get(),
-                            translate_mode,
-                            self.include_brand.get()
-                        )
-
-                        # ASINから取得したブランド名がある場合はそれを優先
-                        if brand_from_asin:
-                            result['brand'] = brand_from_asin
-
-                        result['asin'] = asin  # ASINも結果に保存
-
-                    except Exception as e:
-                        print(f"process_single_title エラー: {asin} -> {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # エラー時も空の結果を作成
-                        result = {
-                            'asin': asin,
-                            'original_title': title,
-                            'brand': brand_from_asin if brand_from_asin else '',
-                            'keywords': [],
-                            'translated_keywords': []
-                        }
-
-                # 結果を追加（エラーでも追加）
-                if result:
+                    # 結果を追加
                     results.append(result)
                     processed_count += 1
 
@@ -2048,7 +2394,7 @@ class CuteKeywordExtractorGUI:
                     # リアルタイム表示
                     self.display_result(result)
 
-                    # 処理完了後にプログレスバーと統計情報を更新
+                    # プログレスバーと統計情報を更新
                     self.update_progress(processed_count, total_count, start_time)
                     self.stats_label.config(
                         text=f"件数: {processed_count}/{total_count}\nブランド数: {brand_count}\n処理状況: 処理中..."
@@ -2057,6 +2403,12 @@ class CuteKeywordExtractorGUI:
                         text=f"処理中... {processed_count}/{total_count}",
                         fg=self.colors['text_primary']
                     )
+
+                    # ブランド名取得モードは処理が速いため、追加の待機時間を設ける
+                    import random
+                    wait_time = random.uniform(10, 15)
+                    print(f"次のリクエストまで {wait_time:.1f}秒待機中...")
+                    time.sleep(wait_time)
 
             # 統計更新（最終）
             self.stats_label.config(
