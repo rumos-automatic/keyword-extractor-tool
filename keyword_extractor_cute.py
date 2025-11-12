@@ -1709,6 +1709,24 @@ class CuteKeywordExtractorGUI:
             prompt_btn.pack(anchor='w')
             self.ui_widgets.append({'widget': prompt_btn, 'font_type': 'label'})
 
+        # 進捗リセットボタン
+        reset_frame = tk.Frame(left_panel, bg=self.colors['bg_secondary'])
+        reset_frame.pack(fill='x', padx=20, pady=10)
+
+        reset_btn = tk.Button(reset_frame,
+                             text="進捗リセット",
+                             font=self.get_scaled_font('label'),
+                             bg='#ff5722',  # 赤系（Material Design Red）
+                             fg='white',
+                             relief='flat',
+                             bd=0,
+                             padx=10,
+                             pady=5,
+                             cursor='hand2',
+                             command=self.reset_progress)
+        reset_btn.pack(anchor='w')
+        self.ui_widgets.append({'widget': reset_btn, 'font_type': 'label'})
+
         # 統計情報
         stats_frame = tk.Frame(left_panel, bg=self.colors['bg_tertiary'])
         stats_frame.pack(fill='x', padx=20, pady=20)
@@ -2419,8 +2437,18 @@ class CuteKeywordExtractorGUI:
             self.update_progress(processed_count, total_count, start_time)
             self.time_remaining_label.config(text="")  # 残り時間をクリア
 
-            # ステータス更新
-            self.result_status.config(text=f"✓ {processed_count}件処理完了", fg=self.colors['text_primary'])
+            # ステータス更新（スキップ件数を表示）
+            skipped_count = total_count - processed_count
+            if skipped_count > 0:
+                self.result_status.config(
+                    text=f"✓ {processed_count}件処理完了（{skipped_count}件スキップ）",
+                    fg=self.colors['text_primary']
+                )
+            else:
+                self.result_status.config(
+                    text=f"✓ {processed_count}件処理完了",
+                    fg=self.colors['text_primary']
+                )
 
         except Exception as e:
             self.result_status.config(text="エラー発生", fg=self.colors['text_primary'])
@@ -2441,6 +2469,55 @@ class CuteKeywordExtractorGUI:
         # プログレスバーもリセット
         self.progress_bar['value'] = 0
         self.progress_text.config(text="0 / 0 (0%)")
+
+    def reset_progress(self):
+        """進捗ファイルをリセット"""
+        import os
+        from tkinter import messagebox
+
+        progress_file = '.progress.json'
+
+        # 進捗ファイルの存在確認
+        if not os.path.exists(progress_file):
+            messagebox.showinfo(
+                "進捗リセット",
+                "リセットする進捗データはありません。\n\n進捗ファイル (.progress.json) が見つかりませんでした。"
+            )
+            return
+
+        # 確認ダイアログ
+        try:
+            # 進捗ファイルの内容を読み込んで件数を表示
+            import json
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                progress_data = json.load(f)
+                processed_count = len(progress_data.get('processed_asins', []))
+
+            message = f"現在の進捗データ（{processed_count}件）を削除します。\n\nこの操作は取り消せません。\n本当に削除しますか？"
+        except:
+            message = "進捗データを削除します。\n\nこの操作は取り消せません。\n本当に削除しますか？"
+
+        result = messagebox.askyesno(
+            "進捗リセット確認",
+            message,
+            icon='warning'
+        )
+
+        if result:
+            try:
+                os.remove(progress_file)
+                messagebox.showinfo(
+                    "完了",
+                    "進捗データをリセットしました。\n\n次回の処理は最初から開始されます。"
+                )
+                self.result_status.config(text="進捗リセット完了", fg=self.colors['text_primary'])
+                print(f"[INFO] 進捗ファイルを削除しました: {progress_file}")
+            except Exception as e:
+                messagebox.showerror(
+                    "エラー",
+                    f"進捗ファイルの削除に失敗しました:\n{str(e)}"
+                )
+                print(f"[ERROR] 進捗ファイル削除エラー: {e}")
 
     def pause_processing(self):
         """処理を一時停止/再開"""
